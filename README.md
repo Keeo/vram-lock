@@ -13,6 +13,30 @@ as corrupted/unstable, **frees all previously successful allocations**, keeps th
 faulty allocation resident (“locks” it), and then sleeps forever so the bad pages
 cannot be reused.
 
+```
+GPU 0 (NVIDIA GeForce RTX 4090)
+Slice size: 64 MiB (67108864 bytes)
+Slices held (locked faulty): 1   OK: 358   Faulty locked: 1   In-progress: 0
+Slices held (allocations): 1
+Map entries: 359
+Total held: 64 MiB
+Elapsed: 47s
+Next slice index: 359
+Last status: STOP: cuMemAlloc failed (likely OOM). Freeing all OK slices; keeping only faulty locked.
+Last md5: f1c88a14a4e6020ad4121468b7365c4f
+
+VRAM slice map ('#'=allocated OK, 'X'=faulty locked, '?'=in-progress, '.'=freed after OOM)
+     0: ..................X.............................................
+    64: ................................................................
+   128: ................................................................
+   192: ................................................................
+   256: ................................................................
+   320: .......................................
+
+cuMemAlloc failed at slice #359: CUDA_ERROR_OUT_OF_MEMORY (2) - out of memory
+Sleeping forever holding only faulty VRAM allocations.
+```
+
 ---
 
 ## What it can do (matches the code)
