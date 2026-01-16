@@ -7,8 +7,18 @@ Behavior:
 - Fill with deterministic byte pattern.
 - Copy device->host twice and MD5 hash both copies.
 - If hashes match: keep allocation, allocate another slice, repeat.
-- If mismatch: free all previous allocations, keep the broken one,
-  then sleep forever holding that allocation.
+- If mismatch: keep the allocation (lock it), mark it as faulty, and continue.
+- Continue until cuMemAlloc fails (OOM). Then:
+    NEW BEHAVIOR: free all non-faulty allocations and keep only faulty chunks locked.
+    Sleep forever holding only the faulty allocations.
+
+UI:
+- Simple ANSI terminal UI showing an ASCII "VRAM map" of slices:
+    '#' = allocated + verified OK (still held)
+    'X' = mismatch detected (faulty chunk locked)
+    '?' = allocated and currently being processed (in-progress)
+    '.' = freed after OOM (visual "cleared" state)
+- Shows counters and last result.
 
 Usage:
   ./gpu-lock [gpu_index] [slice_mebibytes]
@@ -91,6 +101,215 @@ static bool parse_u32(const char* s, unsigned int* out) {
   return true;
 }
 
+static void ansi_clear_screen() {
+  // Clear screen + move cursor to home.
+  std::fputs("\x1b[2J\x1b[H", stdout);
+}
+
+static void ansi_hide_cursor() {
+  std::fputs("\x1b[?25l", stdout);
+}
+
+static void ansi_show_cursor() {
+  std::fputs("\x1b[?25h", stdout);
+}
+
+static size_t count_char(const std::vector<char>& v, char c) {
+  size_t n = 0;
+  for (char x : v) {
+    if (x == c) ++n;
+  }
+  return n;
+}
+
+static void finalize_map_after_oom(std::vector<char>& map) {
+  // After OOM we free all non-faulty allocations; show freed blocks as '.'
+  // Keep 'X' as-is.
+  for (char& c : map) {
+    if (c == '#' || c == '?') c = '.';
+  }
+}
+
+static void render_ui(unsigned int gpu_index,
+                      const char* dev_name,
+                      unsigned int slice_mib,
+                      size_t slice_bytes,
+                      size_t idx_next,
+                      size_t allocations_held,
+                      bool finalized_after_oom,
+                      const std::vector<char>& map,
+                      size_t ok_count,
+                      size_t bad_count,
+                      const std::string& last_status,
+                      const std::string& last_md5_ok,
+                      const std::string& last_md5_1,
+                      const std::string& last_md5_2,
+                      std::chrono::steady_clock::time_point t0) {
+  const auto now = std::chrono::steady_clock::now();
+  const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - t0).count();
+
+  const size_t in_progress = finalized_after_oom ? 0 : count_char(map, '?');
+  const size_t locked_faulty = count_char(map, 'X');
+
+  ansi_clear_screen();
+
+  std::printf("GPU %u (%s)\n", gpu_index, dev_name ? dev_name : "");
+  std::printf("Slice size: %u MiB (%zu bytes)\n", slice_mib, slice_bytes);
+
+  if (finalized_after_oom) {
+    std::printf("Slices held (locked faulty): %zu   OK: %zu   Faulty locked: %zu   In-progress: %zu\n",
+                locked_faulty, ok_count, bad_count, in_progress);
+    std::printf("Slices held (allocations): %zu\n", allocations_held);
+  } else {
+    std::printf("Slices held (allocations): %zu   OK: %zu   Faulty locked: %zu   In-progress: %zu\n",
+                allocations_held, ok_count, bad_count, in_progress);
+  }
+
+  std::printf("Map entries: %zu\n", map.size());
+
+  std::printf("Total held: %zu MiB\n", (allocations_held * static_cast<size_t>(slice_mib)));
+  std::printf("Elapsed: %llds\n", static_cast<long long>(elapsed));
+  std::printf("Next slice index: %zu\n", idx_next);
+  std::printf("Last status: %s\n", last_status.c_str());
+
+  if (!last_md5_1.empty() && !last_md5_2.empty()) {
+    std::printf("Last md5 #1: %s\n", last_md5_1.c_str());
+    std::printf("Last md5 #2: %s\n", last_md5_2.c_str());
+  } else if (!last_md5_ok.empty()) {
+    std::printf("Last md5: %s\n", last_md5_ok.c_str());
+  }
+
+  std::printf("\nVRAM slice map ('#'=allocated OK, 'X'=faulty locked, '?'=in-progress, '.'=freed after OOM)\n");
+
+  constexpr size_t COLS = 64;
+  for (size_t i = 0; i < map.size(); i += COLS) {
+    const size_t end = (i + COLS < map.size()) ? (i + COLS) : map.size();
+    std::printf("%6zu: ", i);
+    for (size_t j = i; j < end; ++j) {
+      std::putchar(map[j]);
+    }
+    std::putchar('\n');
+  }
+
+  std::fflush(stdout);
+}
+
+struct VramLockState {
+  unsigned int gpu_index = 0;
+  const char* dev_name = nullptr;
+
+  unsigned int slice_mib = 0;
+  size_t slice_bytes = 0;
+
+  std::vector<CUdeviceptr> allocations;
+  std::vector<char> map;
+
+  size_t ok_count = 0;
+  size_t bad_count = 0;
+
+  std::vector<uint8_t> host1;
+  std::vector<uint8_t> host2;
+
+  std::string last_status = "Starting...";
+
+  std::string last_md5_ok;
+  std::string last_md5_1;
+  std::string last_md5_2;
+
+  bool finalized_after_oom = false;
+
+  VramLockState(unsigned int gpu_index_,
+                const char* dev_name_,
+                unsigned int slice_mib_,
+                size_t slice_bytes_)
+      : gpu_index(gpu_index_),
+        dev_name(dev_name_),
+        slice_mib(slice_mib_),
+        slice_bytes(slice_bytes_),
+        host1(slice_bytes_),
+        host2(slice_bytes_) {
+    allocations.reserve(64);
+    map.reserve(256);
+  }
+
+  CUresult make_allocation() {
+    CUdeviceptr dptr = 0;
+    CUresult r = cuMemAlloc(&dptr, slice_bytes);
+    if (r != CUDA_SUCCESS) return r;
+
+    allocations.push_back(dptr);
+    map.push_back('?');
+    return CUDA_SUCCESS;
+  }
+
+  void test_pointer(size_t idx) {
+    if (idx >= allocations.size() || idx >= map.size()) {
+      std::fprintf(stderr, "Internal error: test_pointer idx out of range.\n");
+      std::fflush(stderr);
+      std::exit(1);
+    }
+
+    CUdeviceptr dptr = allocations[idx];
+
+    last_status = "Allocated slice; filling pattern...";
+    last_md5_1.clear();
+    last_md5_2.clear();
+
+    die_cuda(cuMemsetD8(dptr, static_cast<unsigned char>(FILL_BYTE), slice_bytes), "cuMemsetD8");
+
+    last_status = "Copying + hashing (pass 1)...";
+    die_cuda(cuMemcpyDtoH(host1.data(), dptr, slice_bytes), "cuMemcpyDtoH #1");
+    std::string h1 = md5_hex(host1.data(), host1.size());
+
+    last_status = "Copying + hashing (pass 2)...";
+    die_cuda(cuMemcpyDtoH(host2.data(), dptr, slice_bytes), "cuMemcpyDtoH #2");
+    std::string h2 = md5_hex(host2.data(), host2.size());
+
+    if (h1 != h2) {
+      last_md5_1 = h1;
+      last_md5_2 = h2;
+
+      map[idx] = 'X';
+      ++bad_count;
+      last_status = "MISMATCH detected: locking faulty chunk and continuing...";
+      return;
+    }
+
+    last_md5_ok = h1;
+    last_md5_1.clear();
+    last_md5_2.clear();
+
+    map[idx] = '#';
+    ++ok_count;
+
+    last_status = "OK";
+  }
+
+  // After OOM: free all non-faulty allocations and keep only the faulty ones ('X').
+  void free_all_except_faulty() {
+    if (allocations.size() != map.size()) {
+      std::fprintf(stderr, "Internal error: allocations/map size mismatch.\n");
+      std::fflush(stderr);
+      std::exit(1);
+    }
+
+    std::vector<CUdeviceptr> kept;
+    kept.reserve(count_char(map, 'X'));
+
+    for (size_t i = 0; i < allocations.size(); ++i) {
+      CUdeviceptr dptr = allocations[i];
+      if (map[i] == 'X') {
+        kept.push_back(dptr);
+      } else {
+        // Best-effort free; if it fails, treat as fatal because we want to release VRAM.
+        die_cuda(cuMemFree(dptr), "cuMemFree");
+      }
+    }
+
+    allocations.swap(kept);
+  }
+};
+
 int main(int argc, char** argv) {
   unsigned int gpu_index = 0;
   unsigned int slice_mib = 512;
@@ -123,7 +342,6 @@ int main(int argc, char** argv) {
 
   const size_t slice_bytes = static_cast<size_t>(slice_mib) * 1024ull * 1024ull;
 
-  // --- init + context on selected device ---
   die_cuda(cuInit(0), "cuInit");
 
   int device_count = 0;
@@ -147,75 +365,77 @@ int main(int argc, char** argv) {
   CUcontext ctx = nullptr;
   die_cuda(cuCtxCreate(&ctx, nullptr, 0, dev), "cuCtxCreate");
 
-  std::vector<CUdeviceptr> allocations;
-  allocations.reserve(64);
-
-  std::printf("Starting on GPU %u (%s). Slice size = %u MiB\n", gpu_index, dev_name, slice_mib);
-  std::fflush(stdout);
-
-  size_t idx = 0;
-
-  // Host buffers reused each iteration
-  std::vector<uint8_t> host1(slice_bytes);
-  std::vector<uint8_t> host2(slice_bytes);
-
   auto cleanup = [&]() {
+    ansi_show_cursor();
     std::printf("\nCleaning up allocations...\n");
     std::fflush(stdout);
-    for (auto p : allocations) {
-      (void)cuMemFree(p);
-    }
-    allocations.clear();
     (void)cuCtxDestroy(ctx);
   };
 
+  const auto t0 = std::chrono::steady_clock::now();
+
+  ansi_hide_cursor();
+
+  VramLockState state(gpu_index, dev_name, slice_mib, slice_bytes);
+
+  size_t idx = 0;
+
   try {
     while (true) {
-      CUdeviceptr dptr = 0;
-      CUresult r = cuMemAlloc(&dptr, slice_bytes);
+      render_ui(state.gpu_index, state.dev_name, state.slice_mib, state.slice_bytes, idx,
+                state.allocations.size(), state.finalized_after_oom, state.map, state.ok_count,
+                state.bad_count, state.last_status, state.last_md5_ok, state.last_md5_1,
+                state.last_md5_2, t0);
 
+      CUresult r = state.make_allocation();
       if (r != CUDA_SUCCESS) {
         const char* name = nullptr;
+        const char* desc = nullptr;
         cuGetErrorName(r, &name);
-        std::printf("STOP: cuMemAlloc failed at slice #%zu: %s (%d)\n",
-                    idx, name ? name : "UNKNOWN", static_cast<int>(r));
-        std::fflush(stdout);
-        break;
-      }
+        cuGetErrorString(r, &desc);
 
-      // fill pattern
-      die_cuda(cuMemsetD8(dptr, static_cast<unsigned char>(FILL_BYTE), slice_bytes), "cuMemsetD8");
+        state.last_status =
+            "STOP: cuMemAlloc failed (likely OOM). Freeing all OK slices; keeping only faulty locked.";
+        state.last_md5_1.clear();
+        state.last_md5_2.clear();
 
-      // copy twice
-      die_cuda(cuMemcpyDtoH(host1.data(), dptr, slice_bytes), "cuMemcpyDtoH #1");
-      std::string h1 = md5_hex(host1.data(), host1.size());
+        // Free everything except faulty chunks.
+        state.free_all_except_faulty();
 
-      die_cuda(cuMemcpyDtoH(host2.data(), dptr, slice_bytes), "cuMemcpyDtoH #2");
-      std::string h2 = md5_hex(host2.data(), host2.size());
+        // Update map visualization to show freed blocks.
+        finalize_map_after_oom(state.map);
+        state.finalized_after_oom = true;
 
-      if (h1 != h2) {
-        std::printf(
-            "\nMISMATCH at slice #%zu!\n"
-            "  md5 #1: %s\n"
-            "  md5 #2: %s\n"
-            "Freeing all previous allocations; keeping the broken one.\n\n",
-            idx, h1.c_str(), h2.c_str());
+        render_ui(state.gpu_index, state.dev_name, state.slice_mib, state.slice_bytes, idx,
+                  state.allocations.size(), state.finalized_after_oom, state.map, state.ok_count,
+                  state.bad_count, state.last_status, state.last_md5_ok, state.last_md5_1,
+                  state.last_md5_2, t0);
+
+        std::printf("\ncuMemAlloc failed at slice #%zu: %s (%d) - %s\n",
+                    idx, name ? name : "UNKNOWN", static_cast<int>(r), desc ? desc : "");
         std::fflush(stdout);
 
-        // Free all previously successful allocations.
-        for (CUdeviceptr p : allocations) {
-          (void)cuMemFree(p);
-        }
-        allocations.clear();
-
-        // Keep the broken allocation held.
-        allocations.push_back(dptr);
-        sleep_forever("Sleeping forever with the broken VRAM allocation held.");
+        sleep_forever("Sleeping forever holding only faulty VRAM allocations.");
       }
 
-      allocations.push_back(dptr);
-      std::printf("OK slice #%zu  md5=%s  kept=%zu\n", idx, h1.c_str(), allocations.size());
-      std::fflush(stdout);
+      const size_t this_idx = state.allocations.size() - 1;
+
+      state.last_status = "Allocated slice; filling pattern...";
+      state.last_md5_1.clear();
+      state.last_md5_2.clear();
+
+      render_ui(state.gpu_index, state.dev_name, state.slice_mib, state.slice_bytes, idx,
+                state.allocations.size(), state.finalized_after_oom, state.map, state.ok_count,
+                state.bad_count, state.last_status, state.last_md5_ok, state.last_md5_1,
+                state.last_md5_2, t0);
+
+      state.test_pointer(this_idx);
+
+      render_ui(state.gpu_index, state.dev_name, state.slice_mib, state.slice_bytes, idx,
+                state.allocations.size(), state.finalized_after_oom, state.map, state.ok_count,
+                state.bad_count, state.last_status, state.last_md5_ok, state.last_md5_1,
+                state.last_md5_2, t0);
+
       ++idx;
     }
   } catch (...) {
