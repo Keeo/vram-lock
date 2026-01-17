@@ -5,8 +5,8 @@ VRAM integrity stress / "lock" test (CUDA Driver API)
 Behavior:
 - Allocate a configurable slice size on a configurable GPU repeatedly.
 - Fill with deterministic byte pattern.
-- Copy device->host twice and MD5 hash both copies.
-- If hashes match: keep allocation, allocate another slice, repeat.
+- Copy device->host twice and compare the two host copies byte-for-byte.
+- If copies match: keep allocation, allocate another slice, repeat.
 - If mismatch: keep the allocation (lock it), mark it as faulty, and continue.
 - Continue until cuMemAlloc fails (OOM). Then:
     NEW BEHAVIOR: free all non-faulty allocations and keep only faulty chunks locked.
@@ -27,12 +27,10 @@ Defaults:
   slice_mebibytes = 512
 
 Build:
-  g++ -O2 -std=c++17 vram_lock.cpp -o gpu-lock -lcuda -lcrypto
+  g++ -O2 -std=c++17 vram_lock.cpp -o gpu-lock -lcuda
 */
 
 #include <cuda.h>
-
-#include <openssl/md5.h>
 
 #include <chrono>
 #include <cstdint>
@@ -60,20 +58,6 @@ static void die_cuda(CUresult r, const char* what) {
                desc ? desc : "no description");
   std::fflush(stderr);
   std::exit(1);
-}
-
-static std::string md5_hex(const uint8_t* data, size_t n) {
-  unsigned char digest[MD5_DIGEST_LENGTH];
-  MD5(data, n, digest);
-
-  static const char* hex = "0123456789abcdef";
-  std::string out;
-  out.resize(MD5_DIGEST_LENGTH * 2);
-  for (int i = 0; i < MD5_DIGEST_LENGTH; ++i) {
-    out[i * 2 + 0] = hex[(digest[i] >> 4) & 0xF];
-    out[i * 2 + 1] = hex[(digest[i] >> 0) & 0xF];
-  }
-  return out;
 }
 
 [[noreturn]] static void sleep_forever(const char* msg) {
@@ -172,11 +156,12 @@ static void render_ui(unsigned int gpu_index,
   std::printf("Next slice index: %zu\n", idx_next);
   std::printf("Last status: %s\n", last_status.c_str());
 
+  // These fields are kept for UI compatibility, but now carry simple compare info.
   if (!last_md5_1.empty() && !last_md5_2.empty()) {
-    std::printf("Last md5 #1: %s\n", last_md5_1.c_str());
-    std::printf("Last md5 #2: %s\n", last_md5_2.c_str());
+    std::printf("Last compare #1: %s\n", last_md5_1.c_str());
+    std::printf("Last compare #2: %s\n", last_md5_2.c_str());
   } else if (!last_md5_ok.empty()) {
-    std::printf("Last md5: %s\n", last_md5_ok.c_str());
+    std::printf("Last compare: %s\n", last_md5_ok.c_str());
   }
 
   std::printf("\nVRAM slice map ('#'=allocated OK, 'X'=faulty locked, '?'=in-progress, '.'=freed after OOM)\n");
@@ -212,6 +197,7 @@ struct VramLockState {
 
   std::string last_status = "Starting...";
 
+  // Kept names to minimize UI churn; now used for compare status strings.
   std::string last_md5_ok;
   std::string last_md5_1;
   std::string last_md5_2;
@@ -257,17 +243,18 @@ struct VramLockState {
 
     die_cuda(cuMemsetD8(dptr, static_cast<unsigned char>(FILL_BYTE), slice_bytes), "cuMemsetD8");
 
-    last_status = "Copying + hashing (pass 1)...";
+    last_status = "Copying (pass 1)...";
     die_cuda(cuMemcpyDtoH(host1.data(), dptr, slice_bytes), "cuMemcpyDtoH #1");
-    std::string h1 = md5_hex(host1.data(), host1.size());
 
-    last_status = "Copying + hashing (pass 2)...";
+    last_status = "Copying (pass 2)...";
     die_cuda(cuMemcpyDtoH(host2.data(), dptr, slice_bytes), "cuMemcpyDtoH #2");
-    std::string h2 = md5_hex(host2.data(), host2.size());
 
-    if (h1 != h2) {
-      last_md5_1 = h1;
-      last_md5_2 = h2;
+    last_status = "Comparing host copies...";
+    const int cmp = std::memcmp(host1.data(), host2.data(), slice_bytes);
+
+    if (cmp != 0) {
+      last_md5_1 = "DIFFERENT";
+      last_md5_2 = "DIFFERENT";
 
       map[idx] = 'X';
       ++bad_count;
@@ -275,7 +262,7 @@ struct VramLockState {
       return;
     }
 
-    last_md5_ok = h1;
+    last_md5_ok = "MATCH";
     last_md5_1.clear();
     last_md5_2.clear();
 
