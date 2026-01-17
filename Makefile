@@ -19,7 +19,7 @@ SRC    := vram_lock.cpp
 CXXFLAGS ?= -O2 -std=c++17 -Wall -Wextra -Wpedantic
 CPPFLAGS := -I$(CUDA_HOME)/include
 LDFLAGS  := -L$(CUDA_HOME)/lib64
-LDLIBS   := -lcuda -lcrypto
+LDLIBS   := -lcuda
 
 # Optional: silence OpenSSL 3.0 MD5 deprecation warnings if you kept MD5()
 ifeq ($(SUPPRESS_OPENSSL_DEPRECATED),1)

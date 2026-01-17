@@ -43,9 +43,51 @@ Build:
 
 #ifdef _WIN32
 #  include <windows.h>
+#else
+#  include <csignal>
 #endif
 
 static constexpr unsigned int FILL_BYTE = 0xA5;
+
+static void ansi_clear_screen() {
+  // Clear screen + move cursor to home.
+  std::fputs("\x1b[2J\x1b[H", stdout);
+}
+
+static void ansi_hide_cursor() {
+  std::fputs("\x1b[?25l", stdout);
+}
+
+static void ansi_show_cursor() {
+  std::fputs("\x1b[?25h", stdout);
+}
+
+static void restore_terminal_state() {
+  // Best-effort: show cursor and flush. Safe to call multiple times.
+  ansi_show_cursor();
+  std::fflush(stdout);
+}
+
+#ifndef _WIN32
+static void on_signal(int /*signum*/) {
+  restore_terminal_state();
+  std::_Exit(128); // async-signal-safe exit
+}
+#endif
+
+static void install_terminal_restore_handlers() {
+  // Always restore cursor on normal exit paths.
+  std::atexit(restore_terminal_state);
+
+#ifndef _WIN32
+  // Restore cursor on Ctrl+C / termination.
+  std::signal(SIGINT, on_signal);
+  std::signal(SIGTERM, on_signal);
+#  ifdef SIGQUIT
+  std::signal(SIGQUIT, on_signal);
+#  endif
+#endif
+}
 
 static void die_cuda(CUresult r, const char* what) {
   if (r == CUDA_SUCCESS) return;
@@ -65,6 +107,9 @@ static void die_cuda(CUresult r, const char* what) {
 }
 
 [[noreturn]] static void sleep_forever(const char* msg) {
+  // Ensure cursor is visible while sleeping forever.
+  restore_terminal_state();
+
   std::printf("%s\n", msg);
   std::fflush(stdout);
   while (true) {
@@ -91,19 +136,6 @@ static bool parse_u32(const char* s, unsigned int* out) {
   if (v > 0xFFFFFFFFul) return false;
   *out = static_cast<unsigned int>(v);
   return true;
-}
-
-static void ansi_clear_screen() {
-  // Clear screen + move cursor to home.
-  std::fputs("\x1b[2J\x1b[H", stdout);
-}
-
-static void ansi_hide_cursor() {
-  std::fputs("\x1b[?25l", stdout);
-}
-
-static void ansi_show_cursor() {
-  std::fputs("\x1b[?25h", stdout);
 }
 
 static size_t count_char(const std::vector<char>& v, char c) {
@@ -306,6 +338,8 @@ struct VramLockState {
 };
 
 int main(int argc, char** argv) {
+  install_terminal_restore_handlers();
+
   unsigned int gpu_index = 0;
   unsigned int slice_mib = 512;
 
@@ -362,7 +396,7 @@ int main(int argc, char** argv) {
   //die_cuda(cuCtxCreate(&ctx, 0, dev), "cuCtxCreate");
 
   auto cleanup = [&]() {
-    ansi_show_cursor();
+    restore_terminal_state();
     std::printf("\nCleaning up allocations...\n");
     std::fflush(stdout);
     (void)cuCtxDestroy(ctx);
