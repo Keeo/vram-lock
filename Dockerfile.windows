@@ -1,0 +1,85 @@
+# Cross-compile vram_lock.cpp → Windows x86_64 exe (CUDA Driver API)
+#
+# Output:
+#   /out/vram_lock.exe
+#
+# Runtime requirements on Windows:
+#   - NVIDIA GPU
+#   - NVIDIA driver installed (provides nvcuda.dll)
+
+FROM ubuntu:22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# ------------------------------------------------------------
+# Toolchain + utilities
+# ------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    wget \
+    p7zip-full \
+    g++ \
+    mingw-w64 \
+    binutils-mingw-w64-x86-64 \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+# ------------------------------------------------------------
+# Fetch CUDA headers from Windows CUDA installer (.exe)
+# ------------------------------------------------------------
+ENV CUDA_WIN_EXE_URL=https://developer.download.nvidia.com/compute/cuda/12.4.1/local_installers/cuda_12.4.1_551.78_windows.exe
+
+RUN set -eux; \
+    mkdir -p /opt/cuda-win/extracted; \
+    wget -O /opt/cuda-win/cuda_windows.exe "${CUDA_WIN_EXE_URL}"; \
+    7z x -o/opt/cuda-win/extracted /opt/cuda-win/cuda_windows.exe >/dev/null; \
+    rm -f /opt/cuda-win/cuda_windows.exe; \
+    CUDA_H_PATH="$(find /opt/cuda-win/extracted -type f -name cuda.h | head -n 1)"; \
+    test -n "$CUDA_H_PATH"; \
+    ln -sf "$(dirname "$CUDA_H_PATH")" /opt/cuda-win/include
+
+ENV CUDA_WIN_INCLUDE=/opt/cuda-win/include
+
+COPY vram_lock.cpp /src/vram_lock.cpp
+
+# ------------------------------------------------------------
+# Generate MinGW import library for nvcuda.dll
+# (derive exports from preprocessed source so macros expand to *_v2)
+# ------------------------------------------------------------
+RUN set -eux; \
+    mkdir -p /opt/nvcuda; \
+    x86_64-w64-mingw32-g++ -E -P \
+        -I"${CUDA_WIN_INCLUDE}" \
+        /src/vram_lock.cpp > /tmp/vram_lock.i; \
+    { \
+      echo "LIBRARY nvcuda.dll"; \
+      echo "EXPORTS"; \
+      grep -oP '\bcu[A-Za-z0-9_]+' /tmp/vram_lock.i \
+        | sort -u \
+        | grep -vE '^(cuda|cursor|currently)$' \
+        | awk '{print "  " $0}'; \
+    } > /opt/nvcuda/nvcuda.def; \
+    x86_64-w64-mingw32-dlltool \
+        -d /opt/nvcuda/nvcuda.def \
+        -l /opt/nvcuda/libnvcuda.a
+
+
+# ------------------------------------------------------------
+# Build Windows executable
+# ------------------------------------------------------------
+RUN x86_64-w64-mingw32-g++ -O2 -std=c++17 \
+     -pthread \
+     -I"${CUDA_WIN_INCLUDE}" \
+     /src/vram_lock.cpp \
+     -o /src/vram_lock.exe \
+     -L/opt/nvcuda -lnvcuda \
+     -static-libgcc -static-libstdc++
+
+# ------------------------------------------------------------
+# Export artifact
+# ------------------------------------------------------------
+RUN mkdir -p /out && cp /src/vram_lock.exe /out/vram_lock.exe
+
+WORKDIR /out
+CMD ["bash", "-lc", "ls -lah /out && file /out/vram_lock.exe"]

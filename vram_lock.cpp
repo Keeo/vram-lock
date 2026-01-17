@@ -41,6 +41,10 @@ Build:
 #include <thread>
 #include <vector>
 
+#ifdef _WIN32
+#  include <windows.h>
+#endif
+
 static constexpr unsigned int FILL_BYTE = 0xA5;
 
 static void die_cuda(CUresult r, const char* what) {
@@ -64,7 +68,11 @@ static void die_cuda(CUresult r, const char* what) {
   std::printf("%s\n", msg);
   std::fflush(stdout);
   while (true) {
+#ifdef _WIN32
+    Sleep(60UL * 60UL * 1000UL); // 1 hour
+#else
     std::this_thread::sleep_for(std::chrono::hours(1));
+#endif
   }
 }
 
@@ -351,6 +359,7 @@ int main(int argc, char** argv) {
 
   CUcontext ctx = nullptr;
   die_cuda(cuCtxCreate(&ctx, nullptr, 0, dev), "cuCtxCreate");
+  //die_cuda(cuCtxCreate(&ctx, 0, dev), "cuCtxCreate");
 
   auto cleanup = [&]() {
     ansi_show_cursor();
