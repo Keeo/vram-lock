@@ -1,3 +1,5 @@
+edit: Works as expected! Thanks good, I would not be able to pay for a new GPU.
+
 # vram_lock – GPU VRAM Corruption Finder / “Lock” Tool
 
 `vram_lock` is a minimal C++ utility that tries to **find VRAM allocations that
